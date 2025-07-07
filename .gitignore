@@ -1,3 +1,6 @@
+results/*
+~results/.gitkeep
+
 # Python-generated files
 __pycache__/
 *.py[oc]
