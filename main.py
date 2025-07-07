@@ -55,8 +55,12 @@ for file in files:
             data = src.read(1)  # Read the first (and usually only) band
             transform = src.transform  # Affine transformation (for georeferencing)
             crs = src.crs  # Coordinate reference system
-            transform_save = transform
-            crs_save = crs
+            
+            if transform_save is None:
+                transform_save = transform
+            if crs is not None:
+                crs_save = crs
+            
             data[data==6] = 3   # "coltivi" in "aree non o poco vegetate"
             data[data==7] = 1   # "boschi poco soggetti al fuoco " in "latifoglie"
             data[data==9] = -9999   # Not defined areas in NaNs
