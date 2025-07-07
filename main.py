@@ -9,8 +9,12 @@ import os
 import glob
 from matplotlib.patches import Patch
 
+# Path to the directory containing the .asc files
+DATA_PATH = './data/prp_mktx/'
+RESULTS_PATH = './results/'
+
+
 def encode_grid(grid):
-    
     N = len(grid)
     out = np.empty((N, N), dtype=int)
 
@@ -33,11 +37,14 @@ def encode_grid(grid):
 
     return out
 
-# Path to the directory containing the .asc files
-data_path = './data/prp_mktx/'
 
 # Pattern to match the files
-files = glob.glob(os.path.join(data_path, 'prp????_mktx.asc'))
+files = glob.glob(os.path.join(DATA_PATH, 'prp????_mktx.asc'))
+
+crs_save = None
+transform_save = None
+
+input_data = {}
 
 for file in files:
     # Extract year using regex
@@ -53,12 +60,18 @@ for file in files:
             data[data==6] = 3   # "coltivi" in "aree non o poco vegetate"
             data[data==7] = 1   # "boschi poco soggetti al fuoco " in "latifoglie"
             data[data==9] = -9999   # Not defined areas in NaNs
-            globals()['tosc'+year] = data
+            input_data[f'tosc{year}'] = data
 
 # Starting from 1978
+starting_data = input_data['tosc1978']
+mask = (starting_data == -9999)
+for key in input_data:
+    input_data[key][mask] = -9999
+starting_data = starting_data.copy()
+
+
 
 start_time = time.perf_counter()
-
 np.random.seed(0)
 
 # Parameters
@@ -75,23 +88,32 @@ Sm_system = np.zeros(timesteps)
 Ry_system = np.zeros(timesteps)
 Rm_system = np.zeros(timesteps)
 
-k_sy_sm = 0.1; k_ry_rm = 0.1; k_au   = 0.01
-rho_s = 0.05; rho_sy = 0.0125; rho_r = 0.015; rho_rm = 0.0125
+k_sy_sm = 0.1
+k_ry_rm = 0.1
+k_au   = 0.01
+rho_s = 0.05
+rho_sy = 0.0125
+rho_r = 0.015
+rho_rm = 0.0125
 fraction = 0.75
-mu_s  = rho_s*fraction; mu_sy = rho_sy*fraction; mu_r  = rho_r*fraction; mu_rm = rho_rm*fraction
-w_ry = 0.3;  w_rm = 0.15; w_sy = 0.4;  w_sm = 0.25; w_u = 0.1
 
-omega_l = 0.7; omega_cell = 1 - omega_l
+mu_s  = rho_s*fraction
+mu_sy = rho_sy*fraction
+mu_r  = rho_r*fraction
+mu_rm = rho_rm*fraction
+w_ry = 0.3
+w_rm = 0.15
+w_sy = 0.4
+w_sm = 0.25
+w_u = 0.1
+
+omega_l = 0.7
+omega_cell = 1 - omega_l
 
 # previously np.zeros((TSF_classes, 6)), but a line is enough
 grid = [[{'proportions': np.zeros((1, 6)), 'TSF': 0} for j in range(grid_size)] for i in range(grid_size)] 
 total_cells = grid_size * grid_size
 
-mask = (tosc1978 == -9999)
-for y in np.arange(2007, 2020, 3):
-    globals()['tosc'+str(y)][mask] = -9999
-
-starting_data = tosc1978.copy()
 
 for i in range(grid_size):
     for j in range(grid_size):        
@@ -107,6 +129,9 @@ for i in range(grid_size):
             init_vector = np.array([1,0,0,0,0,0])
         elif starting_data[i,j]==5: # conifere -> Sy, Sm
             init_vector = np.array([0,0,0.2,0.8,0,0])
+        else:
+            raise ValueError(f"Unexpected value {starting_data[i,j]} at position ({i}, {j})")
+        
         grid[i][j]['proportions'][0, :] = init_vector
 
 # Prealloca la griglia per la visualizzazione dei colori (1-based, come in MATLAB)
@@ -129,7 +154,7 @@ for t in range(timesteps):
             crs = src.crs
             fires[fires == -9999] = 0
     except RasterioIOError:
-        print(f'No fire. Creating zero array instead.')
+        print('No fire. Creating zero array instead.')
         fires = np.zeros((grid_size, grid_size), dtype=np.uint8)
         transform = None
         crs = None
@@ -150,8 +175,12 @@ for t in range(timesteps):
     Rm_mean = np.mean(Rm_values[mask].mean())
     
     # Inizializzazione degli accumulatori di sistema
-    A_total = 0.0; U_total = 0.0; Sy_total = 0.0
-    Sm_total = 0.0; Ry_total = 0.0; Rm_total = 0.0
+    A_total = 0.0
+    U_total = 0.0
+    Sy_total = 0.0
+    Sm_total = 0.0
+    Ry_total = 0.0
+    Rm_total = 0.0
 
     # Aggiornamento per ogni cella della griglia
     for i in range(grid_size):
@@ -178,7 +207,7 @@ for t in range(timesteps):
             if fires[i][j]==1:
                 fire = True
                 
-            if fire == False:
+            if not fire:
                 # Calcolo delle influenze locali e globali
                 F_s = omega_cell * Sm_old + omega_l * Sm_mean
                 F_r = omega_cell * Rm_old + omega_l * Rm_mean
@@ -196,8 +225,7 @@ for t in range(timesteps):
                 Ry = (1 - K_ry_sy - k_ry_rm) * Ry_old + K_u_ry * U_old
                 Rm = Rm_old + k_ry_rm * Ry_old + K_sm_rm * Sm_old
 
-            elif fire == True: 
-
+            else: # Fire occurs
                 num_fires += 1
 
                 # Resprouting skill, both younglings and boomers
@@ -230,7 +258,7 @@ for t in range(timesteps):
             new_vals = np.array([A, U, Sy, Sm, Ry, Rm])
             if np.any(new_vals > 1):
                 print(new_vals,i,j)
-                stop
+                # stop # was this used for debugging?
             grid[i][j]['proportions'][level, :] = new_vals
             # np.argmax restituisce indice 0-based: aggiungiamo 1 per avere lo stesso range di MATLAB (1-6)
             color_grid[i, j] = np.argmax(new_vals) + 1
@@ -245,19 +273,24 @@ for t in range(timesteps):
 
     # Saving the grid
     gr = encode_grid(grid)
-    with rasterio.open(
-        '../results/results_tosc_'+str(years[t])+'.asc',
-        'w',
-        driver='AAIGrid',
-        height=gr.shape[0],
-        width=gr.shape[1],
-        count=1,
-        dtype=gr.dtype,
-        crs=crs_save,
-        transform=transform_save,
-        nodata=-9999
-    ) as dst:
-        dst.write(gr, 1)
+    output_filename = os.path.join(RESULTS_PATH, f'results_tosc_{years[t]}.asc')
+    
+    if transform_save is None:
+        print(f"Error: transform not defined for year {years[t]}. Skipping saving.")
+    else:        
+        with rasterio.open(
+            output_filename,
+            'w',
+            driver='AAIGrid',
+            height=gr.shape[0],
+            width=gr.shape[1],
+            count=1,
+            dtype=gr.dtype,
+            crs=crs_save,
+            transform=transform_save,
+            nodata=-9999
+        ) as dst:
+            dst.write(gr, 1)
     
     # Salvataggio dei risultati di sistema medi per timestep
     A_system[t]  = A_total / total_cells
