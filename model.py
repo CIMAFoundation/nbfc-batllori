@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import numpy as np
+from numba import njit
 
 
 INVALID_VALUES = (-9999, -3333, -6666)
@@ -54,80 +55,34 @@ class VegetationFireModel:
 
     def step(self, fire_mask: np.ndarray) -> Dict[str, np.ndarray | float | int]:
         """Advance the model by one timestep using a boolean fire mask."""
-        mask = np.asarray(fire_mask, dtype=bool)
+        mask = np.ascontiguousarray(np.asarray(fire_mask, dtype=bool))
         if mask.shape != (self.grid_size, self.grid_size):
             raise ValueError("fire_mask must match the model grid size")
 
-        sm_values = self.proportions[:, :, 3]
-        rm_values = self.proportions[:, :, 5]
-
-        sm_valid = ~np.isin(sm_values, INVALID_VALUES)
-        rm_valid = ~np.isin(rm_values, INVALID_VALUES)
-
-        Sm_mean = float(sm_values[sm_valid].mean()) if np.any(sm_valid) else 0.0
-        Rm_mean = float(rm_values[rm_valid].mean()) if np.any(rm_valid) else 0.0
-
-        totals = np.zeros(6, dtype=float)
-        fires_this_step = 0
-
-        for i in range(self.grid_size):
-            for j in range(self.grid_size):
-                cell = self.proportions[i, j]
-
-                if cell[0] in INVALID_VALUES:
-                    continue
-
-                A_old, U_old, Sy_old, Sm_old, Ry_old, Rm_old = cell
-                self.tsf[i, j] += 1
-                tsf = self.tsf[i, j]
-
-                fire = bool(mask[i, j])
-                if not fire:
-                    F_s = self.params.omega_cell * Sm_old + self.params.omega_l * Sm_mean
-                    F_r = self.params.omega_cell * Rm_old + self.params.omega_l * Rm_mean
-
-                    K_u_sy = self.mu_s + (self.params.rho_s - self.mu_s) * F_s
-                    K_ry_sy = self.mu_sy + (self.params.rho_sy - self.mu_sy) * F_s
-                    K_u_ry = self.mu_r + (self.params.rho_r - self.mu_r) * F_r
-                    K_sm_rm = self.mu_rm + (self.params.rho_rm - self.mu_rm) * F_s
-
-                    A = (1 - self.params.k_au) * A_old
-                    U = (1 - K_u_sy - K_u_ry) * U_old + self.params.k_au * A_old
-                    Sy = (1 - self.params.k_sy_sm) * Sy_old + K_u_sy * U_old + K_ry_sy * Ry_old
-                    Sm = (1 - K_sm_rm) * Sm_old + self.params.k_sy_sm * Sy_old
-                    Ry = (1 - K_ry_sy - self.params.k_ry_rm) * Ry_old + K_u_ry * U_old
-                    Rm = Rm_old + self.params.k_ry_rm * Ry_old + K_sm_rm * Sm_old
-                else:
-                    fires_this_step += 1
-                    self.num_fires += 1
-
-                    P_ry = min(0.35 ** (3.367 - 0.306 * (tsf - 1.0)), 1.0)
-                    P_rm = min(tsf / 5.0, 1.0)
-
-                    G = (1 - self.params.w_sm) * Sm_old + min((1 - self.params.w_sy) * Sy_old, Sm_old)
-                    T = P_rm * (1 - self.params.w_rm) * Rm_old + P_ry * (1 - self.params.w_ry) * Ry_old
-
-                    C_g = self.params.w_sm * Sm_old + (Sy_old - min((1 - self.params.w_sy) * Sy_old, Sm_old))
-                    C_t = (
-                        (1 - (1 - self.params.w_rm) * P_rm) * Rm_old
-                        + (1 - (1 - self.params.w_ry) * P_ry) * Ry_old
-                    )
-                    C_u = self.params.w_u * U_old
-                    C_u_sy = min(C_u / 2.0, Sm_old)
-                    C_u_a = C_u - C_u_sy
-
-                    A = A_old + C_u_a
-                    U = U_old - C_u_sy - C_u_a + C_g + C_t
-                    Sy = G + C_u_sy
-                    Sm = 0.0
-                    Ry = T
-                    Rm = 0.0
-
-                    self.tsf[i, j] = 0
-
-                new_vals = np.array([A, U, Sy, Sm, Ry, Rm])
-                self.proportions[i, j] = new_vals
-                totals += new_vals
+        totals, fires_this_step = _step_kernel(
+            self.proportions,
+            self.tsf,
+            mask,
+            self.params.k_sy_sm,
+            self.params.k_ry_rm,
+            self.params.k_au,
+            self.params.rho_s,
+            self.params.rho_sy,
+            self.params.rho_r,
+            self.params.rho_rm,
+            self.params.w_ry,
+            self.params.w_rm,
+            self.params.w_sy,
+            self.params.w_sm,
+            self.params.w_u,
+            self.params.omega_l,
+            self.params.omega_cell,
+            self.mu_s,
+            self.mu_sy,
+            self.mu_r,
+            self.mu_rm,
+        )
+        self.num_fires += int(fires_this_step)
 
         averages = totals / self.total_cells
         return {
@@ -183,3 +138,152 @@ class VegetationFireModel:
 
     def grid_shape(self) -> Tuple[int, int]:
         return self.proportions.shape[:2]
+
+
+@njit(cache=True)
+def _step_kernel(
+    proportions,
+    tsf,
+    fire_mask,
+    k_sy_sm,
+    k_ry_rm,
+    k_au,
+    rho_s,
+    rho_sy,
+    rho_r,
+    rho_rm,
+    w_ry,
+    w_rm,
+    w_sy,
+    w_sm,
+    w_u,
+    omega_l,
+    omega_cell,
+    mu_s,
+    mu_sy,
+    mu_r,
+    mu_rm,
+):
+    grid_size = proportions.shape[0]
+
+    sm_sum = 0.0
+    sm_count = 0
+    rm_sum = 0.0
+    rm_count = 0
+
+    for i in range(grid_size):
+        for j in range(grid_size):
+            sm_val = proportions[i, j, 3]
+            if sm_val != -9999.0 and sm_val != -3333.0 and sm_val != -6666.0:
+                sm_sum += sm_val
+                sm_count += 1
+
+            rm_val = proportions[i, j, 5]
+            if rm_val != -9999.0 and rm_val != -3333.0 and rm_val != -6666.0:
+                rm_sum += rm_val
+                rm_count += 1
+
+    Sm_mean = 0.0
+    if sm_count > 0:
+        Sm_mean = sm_sum / sm_count
+
+    Rm_mean = 0.0
+    if rm_count > 0:
+        Rm_mean = rm_sum / rm_count
+
+    totals = np.zeros(6, dtype=np.float64)
+    fires_this_step = 0
+
+    for i in range(grid_size):
+        for j in range(grid_size):
+            A_old = proportions[i, j, 0]
+
+            if A_old == -9999.0 or A_old == -3333.0 or A_old == -6666.0:
+                continue
+
+            U_old = proportions[i, j, 1]
+            Sy_old = proportions[i, j, 2]
+            Sm_old = proportions[i, j, 3]
+            Ry_old = proportions[i, j, 4]
+            Rm_old = proportions[i, j, 5]
+
+            tsf[i, j] += 1
+            tsf_val = tsf[i, j]
+
+            if not fire_mask[i, j]:
+                F_s = omega_cell * Sm_old + omega_l * Sm_mean
+                F_r = omega_cell * Rm_old + omega_l * Rm_mean
+
+                K_u_sy = mu_s + (rho_s - mu_s) * F_s
+                K_ry_sy = mu_sy + (rho_sy - mu_sy) * F_s
+                K_u_ry = mu_r + (rho_r - mu_r) * F_r
+                K_sm_rm = mu_rm + (rho_rm - mu_rm) * F_s
+
+                A = (1 - k_au) * A_old
+                U = (1 - K_u_sy - K_u_ry) * U_old + k_au * A_old
+                Sy = (1 - k_sy_sm) * Sy_old + K_u_sy * U_old + K_ry_sy * Ry_old
+                Sm = (1 - K_sm_rm) * Sm_old + k_sy_sm * Sy_old
+                Ry = (1 - K_ry_sy - k_ry_rm) * Ry_old + K_u_ry * U_old
+                Rm = Rm_old + k_ry_rm * Ry_old + K_sm_rm * Sm_old
+            else:
+                fires_this_step += 1
+
+                power_val = 0.35 ** (3.367 - 0.306 * (tsf_val - 1.0))
+                if power_val < 1.0:
+                    P_ry = power_val
+                else:
+                    P_ry = 1.0
+
+                frac_val = tsf_val / 5.0
+                if frac_val < 1.0:
+                    P_rm = frac_val
+                else:
+                    P_rm = 1.0
+
+                tmp_sy = (1 - w_sy) * Sy_old
+                if tmp_sy < Sm_old:
+                    min_sy_sm = tmp_sy
+                else:
+                    min_sy_sm = Sm_old
+
+                G = (1 - w_sm) * Sm_old + min_sy_sm
+                T = P_rm * (1 - w_rm) * Rm_old + P_ry * (1 - w_ry) * Ry_old
+
+                C_g = w_sm * Sm_old + (Sy_old - min_sy_sm)
+
+                term_rm = (1 - w_rm) * P_rm
+                term_ry = (1 - w_ry) * P_ry
+                C_t = (1 - term_rm) * Rm_old + (1 - term_ry) * Ry_old
+
+                C_u = w_u * U_old
+                C_u_half = C_u / 2.0
+                if C_u_half < Sm_old:
+                    C_u_sy = C_u_half
+                else:
+                    C_u_sy = Sm_old
+                C_u_a = C_u - C_u_sy
+
+                A = A_old + C_u_a
+                U = U_old - C_u_sy - C_u_a + C_g + C_t
+                Sy = G + C_u_sy
+                Sm = 0.0
+                Ry = T
+                Rm = 0.0
+
+                tsf[i, j] = 0
+
+            proportions[i, j, 0] = A
+            proportions[i, j, 1] = U
+            proportions[i, j, 2] = Sy
+            proportions[i, j, 3] = Sm
+            proportions[i, j, 4] = Ry
+            proportions[i, j, 5] = Rm
+
+            totals[0] += A
+            totals[1] += U
+            totals[2] += Sy
+            totals[3] += Sm
+            totals[4] += Ry
+            totals[5] += Rm
+
+    return totals, fires_this_step
