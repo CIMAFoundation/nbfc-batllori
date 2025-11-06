@@ -10,3 +10,10 @@ dependencies = [
     "numba>=0.60.0",
     "rasterio>=1.4.3",
 ]
+
+[project.scripts]
+batllori = "batllori.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
